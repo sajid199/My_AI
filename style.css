@@ -309,6 +309,7 @@ button{ font-family:inherit; }
   position:fixed; inset:0; background:rgba(20,25,30,.5); backdrop-filter:blur(2px);
   display:flex; align-items:center; justify-content:center; z-index:50; padding:20px;
 }
+.modal-overlay[hidden]{ display:none !important; }
 .modal{
   background:var(--paper-raised); border-radius:var(--radius-md); width:100%; max-width:440px;
   box-shadow:var(--shadow); border:1px solid var(--rule);
