@@ -18,6 +18,8 @@ const LS_KEYS = {
 };
 const CHUNK_CHARS = 900;
 const CHUNK_OVERLAP = 150;
+const DEFAULT_MODEL = 'gemini-2.0-flash';
+const FALLBACK_MODELS = ['gemini-2.0-flash', 'gemini-2.0-flash-lite'];
 const SYSTEM_INSTRUCTION =
   "You are an AI assistant. Answer ONLY using the provided document context. " +
   "Do not use outside knowledge. If the answer is not present in the provided " +
@@ -108,25 +110,37 @@ function autoResizeTextarea(){
 // ============================================================================
 // Settings (localStorage)
 // ============================================================================
+function normalizeModelName(model){
+  const raw = (model || '').trim();
+  if (!raw) return DEFAULT_MODEL;
+  const legacyMap = {
+    'gemini-1.5-flash': DEFAULT_MODEL,
+    'gemini-1.5-pro': DEFAULT_MODEL,
+    'gemini-pro': DEFAULT_MODEL,
+  };
+  return legacyMap[raw] || raw;
+}
 function getSettings(){
+  const storedModel = localStorage.getItem(LS_KEYS.model);
   return {
     apiKey:  localStorage.getItem(LS_KEYS.apiKey)  || '',
-    model:   localStorage.getItem(LS_KEYS.model)   || 'gemini-2.0-flash',
+    model:   normalizeModelName(storedModel),
     chunkN:  parseInt(localStorage.getItem(LS_KEYS.chunkN) || '5', 10),
   };
 }
 function openSettings(){
   const s = getSettings();
   apiKeyInput.value = s.apiKey;
-  modelSelect.value = s.model;
+  modelSelect.value = s.model || DEFAULT_MODEL;
   chunkSizeInput.value = s.chunkN;
   settingsOverlay.hidden = false;
   apiKeyInput.focus();
 }
 function closeSettings(){ settingsOverlay.hidden = true; }
 function saveSettings(){
+  const normalizedModel = normalizeModelName(modelSelect.value || DEFAULT_MODEL);
   localStorage.setItem(LS_KEYS.apiKey, apiKeyInput.value.trim());
-  localStorage.setItem(LS_KEYS.model, modelSelect.value);
+  localStorage.setItem(LS_KEYS.model, normalizedModel);
   localStorage.setItem(LS_KEYS.chunkN, String(Math.max(1, Math.min(10, parseInt(chunkSizeInput.value,10) || 5))));
   closeSettings();
   showToast('Settings saved');
@@ -446,31 +460,71 @@ function buildPrompt(question, contextChunks){
     `If the context does not contain the answer, respond with exactly: "${NO_ANSWER_TEXT}"`;
 }
 
+function parseRetryDelay(errText){
+  try{
+    const data = JSON.parse(errText);
+    const retryInfo = data?.error?.details?.find(d => d?.['@type']?.includes('RetryInfo'));
+    const delay = retryInfo?.retryDelay;
+    if (!delay) return null;
+    const secondsMatch = delay.match(/^(\d+(?:\.\d+)?)s$/i);
+    if (secondsMatch) return Math.max(1, Math.ceil(Number(secondsMatch[1])));
+    const minutesMatch = delay.match(/^(\d+(?:\.\d+)?)m$/i);
+    if (minutesMatch) return Math.max(1, Math.ceil(Number(minutesMatch[1]) * 60));
+    const hoursMatch = delay.match(/^(\d+(?:\.\d+)?)h$/i);
+    if (hoursMatch) return Math.max(1, Math.ceil(Number(hoursMatch[1]) * 3600));
+  } catch (e) {
+    // ignore malformed JSON
+  }
+  return null;
+}
+
 async function callGemini(prompt){
   const { apiKey, model } = getSettings();
   if (!apiKey) throw new Error('NO_API_KEY');
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
   const body = {
     systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
     contents: [{ role: 'user', parts: [{ text: prompt }] }],
     generationConfig: { temperature: 0.2, maxOutputTokens: 1024 },
   };
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+  const candidates = [normalizeModelName(model), ...FALLBACK_MODELS.filter(m => m !== normalizeModelName(model))];
+  let lastError = null;
 
-  if (!res.ok){
+  for (const modelName of candidates){
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    if (res.ok){
+      const data = await res.json();
+      const text = data?.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
+      if (!text) throw new Error('EMPTY_RESPONSE');
+      return text;
+    }
+
     const errText = await res.text().catch(() => '');
-    throw new Error(`API_ERROR: ${res.status} ${errText.slice(0,200)}`);
+    const isQuotaError = res.status === 429 || /quota|RESOURCE_EXHAUSTED|rate limit|retryDelay/i.test(errText);
+    if (isQuotaError){
+      const retryDelay = parseRetryDelay(errText);
+      const delayInfo = retryDelay ? ` Please wait ${retryDelay} seconds and try again.` : ' Please wait a little longer and try again later.';
+      lastError = new Error(`QUOTA_EXCEEDED${retryDelay ? `:${retryDelay}` : ''}: ${errText.slice(0,200)}`);
+      if (retryDelay){
+        showToast(`Gemini quota reached. Waiting ${retryDelay}s…`);
+        await new Promise(resolve => setTimeout(resolve, retryDelay * 1000));
+        continue;
+      }
+      break;
+    }
+
+    lastError = new Error(`API_ERROR: ${res.status} ${errText.slice(0,200)}`);
+    if (res.status !== 404 && !/not found|unsupported/i.test(errText)) break;
   }
-  const data = await res.json();
-  const text = data?.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
-  if (!text) throw new Error('EMPTY_RESPONSE');
-  return text;
+
+  throw lastError || new Error('API_ERROR: Unknown error');
 }
 
 // ============================================================================
@@ -531,8 +585,16 @@ async function sendMessage(){
     removeTypingIndicator();
     console.error(err);
     let msg = 'Something went wrong talking to Gemini.';
-    if (String(err.message).includes('NO_API_KEY')) { msg = 'Add your Gemini API key in Settings first.'; openSettings(); }
-    else if (String(err.message).includes('API_ERROR')) msg = 'Gemini API error — check your API key and model in Settings.';
+    const errText = String(err.message || err);
+    if (errText.includes('NO_API_KEY')) { msg = 'Add your Gemini API key in Settings first.'; openSettings(); }
+    else if (errText.includes('QUOTA_EXCEEDED')) {
+      const retrySeconds = errText.match(/:(\d+):/);
+      const seconds = retrySeconds ? retrySeconds[1] : null;
+      msg = seconds
+        ? `Gemini free-tier quota is exhausted. Please wait ${seconds} seconds and try again later.`
+        : 'Gemini free-tier quota is exhausted. Please wait a little while or use a paid plan.';
+    }
+    else if (errText.includes('API_ERROR')) msg = 'Gemini API error — check your API key and model in Settings.';
     const aiMsg = { role: 'ai', text: msg, time: Date.now(), noAnswer: true };
     chatHistory.push(aiMsg);
     renderMessage(aiMsg);
